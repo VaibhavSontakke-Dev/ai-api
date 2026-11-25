@@ -2,6 +2,11 @@
 
 A governed API in front of a case system, an entitlement system and a usage warehouse, plus an MCP server so AI agents can use it safely. All upstream systems and the identity provider are local mocks. No real data or credentials are used.
 
+<img width="1917" height="966" alt="image" src="https://github.com/user-attachments/assets/69849234-5782-4349-b7f0-acadac0e3c7c" />
+
+<img width="1917" height="1012" alt="image" src="https://github.com/user-attachments/assets/82148363-e20a-444e-8826-384da1a944c9" />
+
+
 | Repository | What |
 |---|---|
 | `ai-api` (this one) | The API, the MCP server, the tests and the documents: the whole assignment |
