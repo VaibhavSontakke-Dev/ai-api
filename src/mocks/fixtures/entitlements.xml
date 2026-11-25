@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<accounts>
+  <account id="ACC-007">
+    <tier>Platinum</tier>
+    <renewal>2027-01-15</renewal>
+  </account>
+  <account id="ACC-012">
+    <tier>Platinum</tier>
+    <renewal>2027-02-10</renewal>
+  </account>
+  <account id="ACC-019">
+    <tier>Platinum</tier>
+    <renewal>2027-06-30</renewal>
+  </account>
+  <account id="ACC-023">
+    <tier>Gold</tier>
+    <renewal>2026-12-20</renewal>
+  </account>
+  <account id="ACC-031">
+    <tier>Platinum</tier>
+    <renewal>2027-01-31</renewal>
+  </account>
+  <account id="ACC-044">
+    <tier>Silver</tier>
+    <renewal>2027-01-05</renewal>
+  </account>
+  <account id="ACC-052">
+    <tier>Platinum</tier>
+    <renewal>2026-12-31</renewal>
+  </account>
+  <account id="ACC-060">
+    <tier>Platinum</tier>
+    <renewal>2027-02-22</renewal>
+  </account>
+  <account id="ACC-061">
+    <tier>Platinum</tier>
+    <renewal>2027-02-23</renewal>
+  </account>
+  <account id="ACC-077">
+    <tier>Gold</tier>
+    <renewal>2027-04-01</renewal>
+  </account>
+  <account id="ACC-088">
+    <tier>Platinum</tier>
+    <renewal>2026-11-10</renewal>
+  </account>
+</accounts>

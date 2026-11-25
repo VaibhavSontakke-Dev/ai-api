@@ -1,0 +1,6 @@
+> escalate_case {"case_id":"CS-10231","case_version":1,"level":"L2","reason":"customer_impact","note":"Please escalate this case"}
+[error] {"error":"forbidden","message":"This user does not have cases:escalate.","hint":"This user does not have permission. Tell the user; do not try another way."}
+
+> get_customer_summary {"customer_id":"ACC-019"}
+[error] {"error":"not-found","message":"Not found","hint":"It does not exist or this user may not see it. Do not try other ids."}
+

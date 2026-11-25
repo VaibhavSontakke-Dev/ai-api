@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "support-copilot": {
+      "command": "node",
+      "args": ["/absolute/path/to/ai-api/mcp/server.ts"],
+      "env": { "COPILOT_USER_TOKEN": "<token from POST http://localhost:4100/dev/login with audience support-copilot>" }
+    }
+  }
+}

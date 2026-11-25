@@ -1,0 +1,44 @@
+{
+  "name": "ai-api",
+  "version": "1.0.0",
+  "description": "Customer Entitlement & Support Case API with an MCP server",
+  "license": "ISC",
+  "author": "",
+  "type": "module",
+  "scripts": {
+    "start": "node src/dev.ts",
+    "test": "node --test \"src/tests/*.test.ts\" \"mcp/*.test.ts\"",
+    "typecheck": "tsc --noEmit",
+    "lint:api": "redocly lint openapi.yaml",
+    "check": "npm run typecheck && npm run lint:api && npm test",
+    "evals": "node --test --test-reporter=spec mcp/evals.test.ts",
+    "mcp": "node mcp/call.ts",
+    "demo": "node mcp/demo.ts",
+    "postman": "npx --yes newman@6 run postman/collection.json -e postman/environment.json"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "ajv": "^8.20.0",
+    "ajv-formats": "^3.0.1",
+    "cors": "^2.8.6",
+    "csv-parse": "^7.0.3",
+    "express": "^5.3.0",
+    "fast-xml-parser": "^5.12.1",
+    "jose": "^6.2.18",
+    "pino": "^10.4.0",
+    "yaml": "^2.9.1",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@anthropic-ai/sdk": "^1.13.0",
+    "@redocly/cli": "^2.83.0",
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.6",
+    "@types/node": "^24.19.2",
+    "typescript": "^7.0.2"
+  },
+  "private": true,
+  "engines": {
+    "node": ">=24"
+  }
+}

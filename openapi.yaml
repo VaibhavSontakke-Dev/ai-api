@@ -1,0 +1,795 @@
+openapi: 3.1.0
+info:
+  title: Customer Entitlement & Support Case API
+  version: 1.0.0
+  license: { name: Proprietary, url: https://example.com/license }
+  description: |
+    One governed API in front of the case system (REST), the entitlement system (CSV export plus XML feed)
+    and the usage warehouse (SQL).
+
+    **Resource modelling.** Consumers see `customers`, `cases` and `action-requests`, never the upstream systems.
+    `GET /v1/customers/{customerId}` aggregates because every consumer needs entitlement and usage together.
+    Cases stay a separate collection because they change often and are filtered and paged. A case carries a small
+    `customer` projection (tier, renewal) so cross-system filters run on the server instead of as N+1 calls.
+
+    **Errors.** Every error is `application/problem+json` (RFC 9457). `type` is the stable machine-readable key;
+    `detail` is for people and may change.
+
+    **Versioning.** Major version in the path. Additive changes ship inside v1, so clients must ignore unknown
+    response fields and unknown enum values. A breaking change means `/v2`, with v1 served for at least 12 months
+    and answering with `Deprecation` (RFC 9745), `Sunset` (RFC 8594) and `Link; rel="successor-version"`. The server
+    sends these from `deprecated: true`, `x-deprecated-at`, `x-sunset` and `x-successor-version` on an operation.
+
+    **Authorization.** OAuth 2.0 bearer JWTs with audience `entitlement-api`. Three layers: scope per operation,
+    account scope per resource (the `accounts` claim; out-of-scope resources answer 404), and scope per field
+    (`arrUsd` needs `customers:arr:read`). Tokens with an `act` claim (RFC 8693) belong to an AI agent acting for
+    a user. The server redacts PII for them, and their writes become action requests a person must approve.
+
+    **Concurrency and retries.** Creates and transitions require `Idempotency-Key`. Escalation also requires
+    `If-Match` with the case ETag.
+
+    **Rate limits.** Every `/v1` response carries `RateLimit-Limit`, `RateLimit-Remaining` and `RateLimit-Reset`;
+    a 429 adds `Retry-After`. Agents have smaller buckets than people.
+
+    **Why REST.** Few resources, cacheable reads, HTTP-native idempotency and preconditions, and iPaaS tools such
+    as MuleSoft import OpenAPI directly. GraphQL suits a UI that composes many optional fields; here it would make
+    field authorization and cost limiting harder. gRPC suits internal high-volume streaming, such as usage events
+    into the warehouse, but is awkward for iPaaS and browsers.
+servers:
+  - { url: "http://localhost:4000", description: Local }
+tags:
+  - { name: Customers, description: Aggregated entitlement and usage }
+  - { name: Cases, description: Support cases and limited actions }
+  - { name: ActionRequests, description: Human approval of agent-initiated writes }
+  - { name: Webhooks, description: Event subscriptions }
+  - { name: Governance, description: Audit and health }
+security:
+  - oauth: []
+
+paths:
+  /v1/customers/{customerId}:
+    get:
+      tags: [Customers]
+      operationId: getCustomer
+      summary: Aggregated customer view
+      description: |
+        Entitlement is the required source. If usage fails the response is still 200 with `degraded: true`.
+        If entitlement fails, the last snapshot (up to 24 h old) is served as `stale`; with no snapshot it is a 503.
+      security: [{ oauth: ["customers:read"] }]
+      parameters: [{ $ref: "#/components/parameters/CustomerId" }]
+      responses:
+        default: { $ref: "#/components/responses/Default" }
+        "200":
+          description: Customer
+          headers: &stdHeaders
+            X-Correlation-Id: { $ref: "#/components/headers/CorrelationId" }
+            RateLimit-Limit: { $ref: "#/components/headers/RateLimitLimit" }
+            RateLimit-Remaining: { $ref: "#/components/headers/RateLimitRemaining" }
+            RateLimit-Reset: { $ref: "#/components/headers/RateLimitReset" }
+          content: { application/json: { schema: { $ref: "#/components/schemas/Customer" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/UpstreamUnavailable" }
+
+  /v1/cases:
+    get:
+      tags: [Cases]
+      operationId: listCases
+      summary: Search cases
+      description: |
+        Filters combine with AND; comma-separated values inside one filter combine with OR.
+        `supportTier`, `renewalWithinDays` and `sort=renewalDate` need entitlement data: if it is unavailable the
+        call fails with 503 rather than returning a silently incomplete list. Without them the list is returned
+        with `meta.degraded: true` and null customer fields.
+      security: [{ oauth: ["cases:read"] }]
+      parameters:
+        - { name: customerId, in: query, schema: { $ref: "#/components/schemas/CustomerId" } }
+        - { name: priority, in: query, style: form, explode: false, schema: { type: array, minItems: 1, uniqueItems: true, items: { $ref: "#/components/schemas/Priority" } } }
+        - { name: status, in: query, style: form, explode: false, schema: { type: array, minItems: 1, uniqueItems: true, items: { $ref: "#/components/schemas/CaseStatus" } } }
+        - { name: supportTier, in: query, style: form, explode: false, schema: { type: array, minItems: 1, uniqueItems: true, items: { $ref: "#/components/schemas/SupportTier" } } }
+        - { name: escalated, in: query, schema: { type: boolean } }
+        - name: openForMoreThanHours
+          in: query
+          description: Strictly more than this many hours since `openedAt`. Resolved and closed cases never match.
+          schema: { type: number, minimum: 0, maximum: 87600 }
+        - name: renewalWithinDays
+          in: query
+          description: Renewal date is today or later and at most this many calendar days (UTC) away. Lapsed renewals never match.
+          schema: { type: integer, minimum: 0, maximum: 730 }
+        - { name: sort, in: query, schema: { type: string, enum: [openedAt, -openedAt, priority, renewalDate], default: -openedAt } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 25 } }
+        - name: cursor
+          in: query
+          description: Opaque, signed and bound to the same filters and sort. Reuse with other filters is a 400.
+          schema: { type: string, maxLength: 1024 }
+      responses:
+        default: { $ref: "#/components/responses/Default" }
+        "200":
+          description: Page of cases
+          headers: *stdHeaders
+          content: { application/json: { schema: { $ref: "#/components/schemas/CaseList" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/UpstreamUnavailable" }
+
+  /v1/cases/{caseId}:
+    get:
+      tags: [Cases]
+      operationId: getCase
+      summary: One case with its latest comments
+      security: [{ oauth: ["cases:read"] }]
+      parameters:
+        - { $ref: "#/components/parameters/CaseId" }
+        - { $ref: "#/components/parameters/IfNoneMatch" }
+      responses:
+        default: { $ref: "#/components/responses/Default" }
+        "200":
+          description: Case
+          headers:
+            ETag: { $ref: "#/components/headers/ETag" }
+          content: { application/json: { schema: { $ref: "#/components/schemas/CaseDetail" } } }
+        "304": { description: Not modified }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/UpstreamUnavailable" }
+
+  /v1/cases/{caseId}/comments:
+    post:
+      tags: [Cases]
+      operationId: addCaseComment
+      summary: Add a comment (idempotent)
+      description: |
+        Same key and same body replays the first response with `Idempotent-Replayed: true`. Same key and a
+        different body is a 422. Agent tokens get 202 and an action request; a replay shows its current state.
+      security: [{ oauth: ["cases:comment"] }]
+      parameters:
+        - { $ref: "#/components/parameters/CaseId" }
+        - { $ref: "#/components/parameters/IdempotencyKey" }
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/NewComment" } } }
+      responses:
+        default: { $ref: "#/components/responses/Default" }
+        "201":
+          description: Created
+          headers:
+            ETag: { $ref: "#/components/headers/ETag" }
+            Idempotent-Replayed: { $ref: "#/components/headers/IdempotentReplayed" }
+          content: { application/json: { schema: { $ref: "#/components/schemas/Comment" } } }
+        "202": { $ref: "#/components/responses/PendingApproval" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "422": { $ref: "#/components/responses/Unprocessable" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/UpstreamUnavailable" }
+
+  /v1/cases/{caseId}/escalate:
+    post:
+      tags: [Cases]
+      operationId: escalateCase
+      summary: Escalate a case one level
+      description: |
+        Rules: `status` must be open, in_progress or waiting_on_customer; `priority` must be P1 or P2;
+        `level` rises one step at a time (none, L2, L3); `min_age`: unless the customer is Platinum, the case has
+        been open at least 4 hours. A broken rule is a 409 whose `type` ends in `escalation-rule`, with `rule`
+        naming it. Emits `case.escalated`. Agent tokens get 202 and an action request.
+      security: [{ oauth: ["cases:escalate"] }]
+      parameters:
+        - { $ref: "#/components/parameters/CaseId" }
+        - { $ref: "#/components/parameters/IdempotencyKey" }
+        - { $ref: "#/components/parameters/IfMatch" }
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/EscalationRequest" } } }
+      responses:
+        default: { $ref: "#/components/responses/Default" }
+        "200":
+          description: Escalated
+          headers:
+            ETag: { $ref: "#/components/headers/ETag" }
+            Idempotent-Replayed: { $ref: "#/components/headers/IdempotentReplayed" }
+          content: { application/json: { schema: { $ref: "#/components/schemas/CaseDetail" } } }
+        "202": { $ref: "#/components/responses/PendingApproval" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "412": { $ref: "#/components/responses/PreconditionFailed" }
+        "422": { $ref: "#/components/responses/Unprocessable" }
+        "428": { $ref: "#/components/responses/PreconditionRequired" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/UpstreamUnavailable" }
+
+  /v1/action-requests:
+    get:
+      tags: [ActionRequests]
+      operationId: listActionRequests
+      summary: Agent-initiated writes
+      description: Users see requests made on their own behalf; `approvals:manage` sees all within account scope.
+      security: [{ oauth: ["cases:read"] }]
+      parameters:
+        - { name: status, in: query, schema: { $ref: "#/components/schemas/ActionStatus" } }
+      responses:
+        default: { $ref: "#/components/responses/Default" }
+        "200":
+          description: Newest 100
+          content: { application/json: { schema: { $ref: "#/components/schemas/ActionRequestList" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /v1/action-requests/{actionRequestId}:
+    get:
+      tags: [ActionRequests]
+      operationId: getActionRequest
+      summary: One action request
+      security: [{ oauth: ["cases:read"] }]
+      parameters: [{ $ref: "#/components/parameters/ActionRequestId" }]
+      responses:
+        default: { $ref: "#/components/responses/Default" }
+        "200":
+          description: Action request
+          content: { application/json: { schema: { $ref: "#/components/schemas/ActionRequest" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /v1/action-requests/{actionRequestId}/approve:
+    post:
+      tags: [ActionRequests]
+      operationId: approveActionRequest
+      summary: Approve and execute (people only)
+      description: |
+        Tokens with an `act` claim are always refused. The approver needs the scope of the underlying action and
+        must be the user the agent acted for, or hold `approvals:manage`. The case version seen by the agent is
+        checked again; if the case changed, the request becomes `stale` and nothing is executed.
+      security: [{ oauth: ["cases:read"] }]
+      parameters: [{ $ref: "#/components/parameters/ActionRequestId" }]
+      responses:
+        default: { $ref: "#/components/responses/Default" }
+        "200":
+          description: Executed
+          content: { application/json: { schema: { $ref: "#/components/schemas/ActionRequest" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "412": { $ref: "#/components/responses/PreconditionFailed" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/UpstreamUnavailable" }
+
+  /v1/action-requests/{actionRequestId}/reject:
+    post:
+      tags: [ActionRequests]
+      operationId: rejectActionRequest
+      summary: Reject (people only)
+      security: [{ oauth: ["cases:read"] }]
+      parameters: [{ $ref: "#/components/parameters/ActionRequestId" }]
+      responses:
+        default: { $ref: "#/components/responses/Default" }
+        "200":
+          description: Rejected
+          content: { application/json: { schema: { $ref: "#/components/schemas/ActionRequest" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /v1/webhook-subscriptions:
+    get:
+      tags: [Webhooks]
+      operationId: listWebhookSubscriptions
+      summary: Subscriptions (secrets never returned)
+      security: [{ oauth: ["webhooks:manage"] }]
+      responses:
+        default: { $ref: "#/components/responses/Default" }
+        "200":
+          description: Subscriptions
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                additionalProperties: false
+                properties: { data: { type: array, items: { $ref: "#/components/schemas/WebhookSubscription" } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+    post:
+      tags: [Webhooks]
+      operationId: createWebhookSubscription
+      summary: Subscribe
+      description: The signing secret is returned once. Targets must be https on a public address, or a host on the operator allowlist.
+      security: [{ oauth: ["webhooks:manage"] }]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/NewWebhookSubscription" } } }
+      responses:
+        default: { $ref: "#/components/responses/Default" }
+        "201":
+          description: Created
+          content: { application/json: { schema: { $ref: "#/components/schemas/WebhookSubscriptionCreated" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "422": { $ref: "#/components/responses/Unprocessable" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /v1/webhook-subscriptions/{subscriptionId}:
+    delete:
+      tags: [Webhooks]
+      operationId: deleteWebhookSubscription
+      summary: Unsubscribe
+      security: [{ oauth: ["webhooks:manage"] }]
+      parameters:
+        - { name: subscriptionId, in: path, required: true, schema: { type: string, pattern: "^whs_[a-f0-9]{16}$" } }
+      responses:
+        default: { $ref: "#/components/responses/Default" }
+        "204": { description: Deleted }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /v1/webhook-subscriptions/{subscriptionId}/rotate-secret:
+    post:
+      tags: [Webhooks]
+      operationId: rotateWebhookSecret
+      summary: Replace the signing secret
+      description: Returns the new secret once. For 24 hours deliveries carry a signature for the old and the new secret.
+      security: [{ oauth: ["webhooks:manage"] }]
+      parameters:
+        - { name: subscriptionId, in: path, required: true, schema: { type: string, pattern: "^whs_[a-f0-9]{16}$" } }
+      responses:
+        default: { $ref: "#/components/responses/Default" }
+        "200":
+          description: Rotated
+          content: { application/json: { schema: { $ref: "#/components/schemas/WebhookSubscriptionCreated" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /v1/agent-tool-calls:
+    post:
+      tags: [Governance]
+      operationId: recordAgentToolCall
+      summary: Record one MCP tool call (agent tokens only)
+      security: [{ oauth: [] }]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/AgentToolCall" } } }
+      responses:
+        default: { $ref: "#/components/responses/Default" }
+        "201":
+          description: Recorded
+          content:
+            application/json:
+              schema: { type: object, required: [seq], additionalProperties: false, properties: { seq: { type: integer } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /v1/audit-events:
+    get:
+      tags: [Governance]
+      operationId: listAuditEvents
+      summary: Audit trail with hash-chain status
+      security: [{ oauth: ["audit:read"] }]
+      parameters:
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 200, default: 50 } }
+        - { name: beforeSeq, in: query, schema: { type: integer, minimum: 1 } }
+        - { name: kind, in: query, schema: { type: string, enum: [http, agent_tool, action, webhook, data_quality] } }
+      responses:
+        default: { $ref: "#/components/responses/Default" }
+        "200":
+          description: Newest first
+          content: { application/json: { schema: { $ref: "#/components/schemas/AuditList" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /healthz:
+    get:
+      tags: [Governance]
+      operationId: health
+      summary: Liveness
+      security: [{}]
+      responses:
+        default: { $ref: "#/components/responses/Default" }
+        "200":
+          description: Alive
+          content: { application/json: { schema: { type: object, required: [status], properties: { status: { const: ok } } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+
+  /readyz:
+    get:
+      tags: [Governance]
+      operationId: ready
+      summary: Readiness with circuit state
+      security: [{}]
+      responses:
+        default: { $ref: "#/components/responses/Default" }
+        "200":
+          description: Ready. Open circuits are reported, not failed, because the API degrades instead.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, upstreams]
+                properties:
+                  status: { type: string, enum: [ok, degraded] }
+                  upstreams: { type: object, additionalProperties: { type: string, enum: [closed, open, half_open] } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+
+webhooks:
+  case.escalated:
+    post:
+      operationId: onCaseEscalated
+      summary: A case was escalated
+      description: |
+        Standard Webhooks signature. Verify before parsing:
+        `webhook-signature: v1,base64(HMAC-SHA256(secret, webhook-id + "." + webhook-timestamp + "." + raw body))`.
+        Compare in constant time, reject timestamps more than 5 minutes away, and deduplicate on `webhook-id`
+        (delivery is at least once and unordered). Any 2xx acknowledges; otherwise there are 6 attempts with
+        exponential backoff. The header may hold several space-separated signatures during secret rotation.
+        The payload carries ids and state only, with no free text, ARR or contact data.
+      security: [{}]
+      parameters:
+        - { name: webhook-id, in: header, required: true, schema: { type: string } }
+        - { name: webhook-timestamp, in: header, required: true, schema: { type: string, pattern: "^[0-9]+$" } }
+        - { name: webhook-signature, in: header, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/CaseEscalatedEvent" } } }
+      responses:
+        "2XX": { description: Acknowledged }
+        "4XX": { description: Not accepted; retried }
+
+components:
+  securitySchemes:
+    oauth:
+      type: oauth2
+      description: Interactive users use authorization code with PKCE; agents use RFC 8693 token exchange; iPaaS uses client credentials. The local IdP is a mock.
+      flows:
+        authorizationCode:
+          authorizationUrl: http://localhost:4100/authorize
+          tokenUrl: http://localhost:4100/token
+          scopes: &scopes
+            customers:read: Read customers without ARR
+            customers:arr:read: Read ARR (Finance; never granted to agents)
+            cases:read: Read cases
+            cases:comment: Add comments
+            cases:escalate: Escalate cases
+            approvals:manage: Approve action requests raised for other users
+            webhooks:manage: Manage webhook subscriptions
+            audit:read: Read the audit trail
+        clientCredentials:
+          tokenUrl: http://localhost:4100/token
+          scopes: *scopes
+  parameters:
+    CustomerId: { name: customerId, in: path, required: true, schema: { $ref: "#/components/schemas/CustomerId" } }
+    CaseId: { name: caseId, in: path, required: true, schema: { $ref: "#/components/schemas/CaseId" } }
+    ActionRequestId: { name: actionRequestId, in: path, required: true, schema: { type: string, pattern: "^act_[a-f0-9]{16}$" } }
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: Unique per logical operation; kept for 24 h per caller and path.
+      schema: { type: string, minLength: 8, maxLength: 128, pattern: "^[A-Za-z0-9_:.-]+$" }
+    IfMatch:
+      name: If-Match
+      in: header
+      required: false
+      description: Case ETag. Marked optional so that a missing header is a 428 rather than a 400.
+      schema: { type: string, pattern: '^"v[0-9]+"$' }
+    IfNoneMatch: { name: If-None-Match, in: header, required: false, schema: { type: string, maxLength: 200 } }
+  headers:
+    ETag: { description: Case version, schema: { type: string } }
+    IdempotentReplayed: { description: Present when a stored response is replayed, schema: { type: string } }
+    RateLimitLimit: { description: Requests per window, schema: { type: string } }
+    RateLimitRemaining: { description: Requests left, schema: { type: string } }
+    RateLimitReset: { description: Seconds until the bucket is full, schema: { type: string } }
+    CorrelationId: { description: Echoed from the request or generated, schema: { type: string } }
+    RetryAfter: { description: Seconds to wait, schema: { type: string } }
+  responses:
+    Default: { description: "Body too large (413 `payload-too-large`) or unexpected failure (500 `internal`)", content: &problem { application/problem+json: { schema: { $ref: "#/components/schemas/Problem" } } } }
+    PendingApproval:
+      description: Agent token. Nothing was changed; a person must approve.
+      headers:
+        Location: { description: The action request, schema: { type: string } }
+        Idempotent-Replayed: { $ref: "#/components/headers/IdempotentReplayed" }
+      content: { application/json: { schema: { $ref: "#/components/schemas/ActionRequest" } } }
+    BadRequest: { description: Validation failed (`validation`) or bad cursor (`invalid-cursor`), content: *problem }
+    Unauthorized:
+      description: Missing, expired or invalid token (`unauthorized`)
+      headers: { WWW-Authenticate: { description: RFC 6750 challenge, schema: { type: string } } }
+      content: *problem
+    Forbidden: { description: Missing scope (`forbidden`) or agent not allowed (`agent-not-allowed`), content: *problem }
+    NotFound: { description: Does not exist or is outside the caller's accounts (`not-found`), content: *problem }
+    Conflict: { description: "Rule broken (`escalation-rule`), key in flight (`idempotency-in-progress`) or already decided (`already-decided`)", content: *problem }
+    PreconditionFailed: { description: The case changed (`version-mismatch`), content: *problem }
+    Unprocessable: { description: Key reused with another body (`idempotency-mismatch`) or target refused (`target-not-allowed`), content: *problem }
+    PreconditionRequired: { description: If-Match is missing (`precondition-required`), content: *problem }
+    RateLimited:
+      description: Too many requests (`rate-limited`)
+      headers: { Retry-After: { $ref: "#/components/headers/RetryAfter" } }
+      content: *problem
+    UpstreamUnavailable:
+      description: A required upstream failed and no usable snapshot exists (`upstream-unavailable`)
+      headers: { Retry-After: { $ref: "#/components/headers/RetryAfter" } }
+      content: *problem
+  schemas:
+    CustomerId: { type: string, pattern: "^ACC-[0-9]{3,6}$", examples: [ACC-007] }
+    CaseId: { type: string, pattern: "^CS-[0-9]{3,9}$", examples: [CS-10231] }
+    Priority: { type: string, enum: [P1, P2, P3, P4] }
+    CaseStatus: { type: string, enum: [open, in_progress, waiting_on_customer, resolved, closed] }
+    SupportTier: { type: string, enum: [Platinum, Gold, Silver, Standard] }
+    EscalationLevel: { type: string, enum: [L2, L3] }
+    EscalationReason: { type: string, enum: [sla_breach_risk, customer_impact, security_concern, executive_request] }
+    ActionStatus: { type: string, enum: [pending, executing, executed, rejected, expired, stale, failed] }
+    SourceStatus:
+      type: object
+      required: [status]
+      additionalProperties: false
+      properties:
+        status: { type: string, enum: [fresh, stale, unavailable] }
+        asOf: { type: [string, "null"], format: date-time }
+        reason: { type: string, enum: [timeout, circuit_open, upstream_error, no_data] }
+    DataQualityNote:
+      type: object
+      required: [code, message]
+      additionalProperties: false
+      properties:
+        code: { type: string, enum: [tier_conflict, renewal_conflict, alias_mapped, missing_in_feed] }
+        message: { type: string }
+    Usage:
+      type: object
+      required: [month, protectedTb, apiCalls, activeUsers]
+      additionalProperties: false
+      properties:
+        month: { type: string, pattern: "^[0-9]{4}-[0-9]{2}$" }
+        protectedTb: { type: number }
+        apiCalls: { type: integer }
+        activeUsers: { type: integer }
+    Customer:
+      type: object
+      required: [id, name, supportTier, contractEndDate, renewalDate, daysToRenewal, usage, degraded, sources, dataQuality, redactedFields, asOf]
+      additionalProperties: false
+      properties:
+        id: { $ref: "#/components/schemas/CustomerId" }
+        name: { type: string }
+        supportTier: { $ref: "#/components/schemas/SupportTier" }
+        contractEndDate: { type: [string, "null"], format: date }
+        renewalDate: { type: [string, "null"], format: date }
+        daysToRenewal: { type: [integer, "null"], description: Negative when lapsed }
+        arrUsd: { type: integer, description: "Present only with `customers:arr:read`" }
+        usage: { anyOf: [{ type: "null" }, { $ref: "#/components/schemas/Usage" }] }
+        degraded: { type: boolean }
+        sources:
+          type: object
+          required: [entitlement, usage]
+          additionalProperties: false
+          properties:
+            entitlement: { $ref: "#/components/schemas/SourceStatus" }
+            usage: { $ref: "#/components/schemas/SourceStatus" }
+        dataQuality: { type: array, items: { $ref: "#/components/schemas/DataQualityNote" } }
+        redactedFields: { type: array, items: { type: string } }
+        asOf: { type: string, format: date-time }
+    CustomerProjection:
+      type: object
+      required: [id, name, supportTier, renewalDate, daysToRenewal, dataQuality]
+      additionalProperties: false
+      properties:
+        id: { $ref: "#/components/schemas/CustomerId" }
+        name: { type: [string, "null"] }
+        supportTier: { anyOf: [{ $ref: "#/components/schemas/SupportTier" }, { type: "null" }] }
+        renewalDate: { type: [string, "null"], format: date }
+        daysToRenewal: { type: [integer, "null"] }
+        dataQuality: { type: array, description: Why tier or renewal may be wrong, items: { $ref: "#/components/schemas/DataQualityNote" } }
+    Escalation:
+      type: object
+      required: [level, reason, at]
+      additionalProperties: false
+      properties:
+        level: { $ref: "#/components/schemas/EscalationLevel" }
+        reason: { $ref: "#/components/schemas/EscalationReason" }
+        at: { type: string, format: date-time }
+    CaseSummary:
+      type: object
+      required: [id, customer, subject, priority, status, openedAt, openHours, escalation, commentCount, version]
+      properties:
+        id: { $ref: "#/components/schemas/CaseId" }
+        customer: { $ref: "#/components/schemas/CustomerProjection" }
+        subject: { type: string }
+        priority: { $ref: "#/components/schemas/Priority" }
+        status: { $ref: "#/components/schemas/CaseStatus" }
+        openedAt: { type: string, format: date-time }
+        openHours: { type: [number, "null"], description: Null once resolved or closed }
+        escalation: { anyOf: [{ $ref: "#/components/schemas/Escalation" }, { type: "null" }] }
+        commentCount: { type: integer }
+        version: { type: integer }
+    CaseDetail:
+      allOf:
+        - { $ref: "#/components/schemas/CaseSummary" }
+        - type: object
+          required: [comments]
+          properties: { comments: { type: array, maxItems: 50, items: { $ref: "#/components/schemas/Comment" } } }
+      unevaluatedProperties: false
+    CaseList:
+      type: object
+      required: [data, meta]
+      additionalProperties: false
+      properties:
+        data: { type: array, items: { $ref: "#/components/schemas/CaseSummary" } }
+        meta:
+          type: object
+          required: [nextCursor, degraded, asOf]
+          additionalProperties: false
+          properties:
+            nextCursor: { type: [string, "null"] }
+            degraded: { type: boolean }
+            entitlement: { $ref: "#/components/schemas/SourceStatus" }
+            asOf: { type: string, format: date-time }
+    NewComment:
+      type: object
+      required: [body]
+      additionalProperties: false
+      properties: { body: { type: string, minLength: 1, maxLength: 4000, pattern: "\\S" } }
+    Comment:
+      type: object
+      required: [id, author, body, at]
+      additionalProperties: false
+      properties:
+        id: { type: string }
+        author: { type: string }
+        body: { type: string }
+        at: { type: string, format: date-time }
+    EscalationRequest:
+      type: object
+      required: [level, reason, note]
+      additionalProperties: false
+      properties:
+        level: { $ref: "#/components/schemas/EscalationLevel" }
+        reason: { $ref: "#/components/schemas/EscalationReason" }
+        note: { type: string, minLength: 10, maxLength: 500 }
+    ActionRequest:
+      type: object
+      required: [id, action, caseId, customerId, caseVersion, payload, status, requestedBy, agent, decidedBy, failure, createdAt, expiresAt]
+      additionalProperties: false
+      properties:
+        id: { type: string }
+        action: { type: string, enum: [add_comment, escalate] }
+        caseId: { $ref: "#/components/schemas/CaseId" }
+        customerId: { $ref: "#/components/schemas/CustomerId" }
+        caseVersion: { type: integer }
+        payload: { anyOf: [{ $ref: "#/components/schemas/NewComment" }, { $ref: "#/components/schemas/EscalationRequest" }] }
+        status: { $ref: "#/components/schemas/ActionStatus" }
+        requestedBy: { type: string }
+        agent: { type: string }
+        decidedBy: { type: [string, "null"] }
+        failure: { type: [string, "null"] }
+        createdAt: { type: string, format: date-time }
+        expiresAt: { type: string, format: date-time }
+    ActionRequestList:
+      type: object
+      required: [data]
+      additionalProperties: false
+      properties: { data: { type: array, items: { $ref: "#/components/schemas/ActionRequest" } } }
+    NewWebhookSubscription:
+      type: object
+      required: [url, events]
+      additionalProperties: false
+      properties:
+        url: { type: string, format: uri, maxLength: 500 }
+        events: { type: array, minItems: 1, uniqueItems: true, items: { type: string, enum: [case.escalated] } }
+    WebhookSubscription:
+      type: object
+      required: [id, url, events, createdAt]
+      properties:
+        id: { type: string }
+        url: { type: string }
+        events: { type: array, items: { type: string } }
+        createdAt: { type: string, format: date-time }
+    WebhookSubscriptionCreated:
+      allOf:
+        - { $ref: "#/components/schemas/WebhookSubscription" }
+        - type: object
+          required: [secret]
+          properties: { secret: { type: string, description: Shown once } }
+      unevaluatedProperties: false
+    CaseEscalatedEvent:
+      type: object
+      required: [id, type, occurredAt, data]
+      additionalProperties: false
+      properties:
+        id: { type: string }
+        type: { const: case.escalated }
+        occurredAt: { type: string, format: date-time }
+        data:
+          type: object
+          required: [caseId, customerId, priority, level, reason, version]
+          additionalProperties: false
+          properties:
+            caseId: { $ref: "#/components/schemas/CaseId" }
+            customerId: { $ref: "#/components/schemas/CustomerId" }
+            priority: { $ref: "#/components/schemas/Priority" }
+            level: { $ref: "#/components/schemas/EscalationLevel" }
+            reason: { $ref: "#/components/schemas/EscalationReason" }
+            version: { type: integer }
+    AgentToolCall:
+      type: object
+      required: [callId, tool, argsSha256, outcome, durationMs, resultChars]
+      additionalProperties: false
+      properties:
+        callId: { type: string, pattern: "^[A-Za-z0-9-]{8,64}$" }
+        tool: { type: string, maxLength: 64, pattern: "^[a-z_]+$" }
+        argsSha256: { type: string, pattern: "^[a-f0-9]{64}$" }
+        outcome: { type: string, enum: [started, ok, pending_approval, error, rate_limited, denied] }
+        durationMs: { type: integer, minimum: 0 }
+        resultChars: { type: integer, minimum: 0 }
+        injectionFlags: { type: integer, minimum: 0 }
+    AuditEvent:
+      type: object
+      required: [seq, at, kind, actor, agent, action, resource, outcome, correlationId, detail]
+      additionalProperties: false
+      properties:
+        seq: { type: integer }
+        at: { type: string, format: date-time }
+        kind: { type: string }
+        actor: { type: string }
+        agent: { type: [string, "null"] }
+        action: { type: string }
+        resource: { type: [string, "null"] }
+        outcome: { type: string }
+        correlationId: { type: [string, "null"] }
+        detail: { type: object }
+    AuditList:
+      type: object
+      required: [data, chainValid, fullyVerifiedAt]
+      additionalProperties: false
+      properties:
+        data: { type: array, items: { $ref: "#/components/schemas/AuditEvent" } }
+        chainValid: { type: boolean, description: False once any check in this process found a break }
+        fullyVerifiedAt: { type: [string, "null"], format: date-time, description: When the whole trail was last checked }
+    Problem:
+      type: object
+      required: [type, title, status, instance, correlationId]
+      properties:
+        type: { type: string, format: uri, examples: ["https://errors.example.com/validation"] }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        instance: { type: string }
+        correlationId: { type: string }
+        rule: { type: string }
+        source: { type: string }
+        requiredScope: { type: string }
+        errors:
+          type: array
+          items:
+            type: object
+            required: [location, message]
+            properties: { location: { type: string }, message: { type: string } }

@@ -1,0 +1,25 @@
+{
+ "name": "Local",
+ "values": [
+  {
+   "key": "baseUrl",
+   "value": "http://localhost:4000",
+   "enabled": true
+  },
+  {
+   "key": "idpUrl",
+   "value": "http://localhost:4100",
+   "enabled": true
+  },
+  {
+   "key": "mockUrl",
+   "value": "http://localhost:4200",
+   "enabled": true
+  },
+  {
+   "key": "agentSecret",
+   "value": "local-agent-secret",
+   "enabled": true
+  }
+ ]
+}

@@ -1,0 +1,9 @@
+> get_case {"case_id":"CS-10231"}
+{"id":"CS-10231","priority":"P1","status":"open","open_hours":747.8,"escalation":null,"version":1,"customer_id":"ACC-007","customer":"Acme Corp","tier":"Platinum","renewal":"2027-01-15","days_to_renewal":52,"untrusted_subject":"Backup failing on node 3","comments_total":1,"comments":[{"at":"2026-10-24T09:00:00Z","untrusted_author":"jdoe","untrusted_body":"Investigating"}]}
+
+> escalate_case {"case_id":"CS-10231","case_version":1,"level":"L2","reason":"customer_impact","note":"Customer impact is severe, backups failing for a month"}
+{"status":"waiting_for_human_approval","action_request_id":"act_f24fdd30200698c3","expires_at":"2026-11-24T12:30:13.362Z","message":"The escalation of CS-10231 to L2 has NOT happened. A person must approve act_f24fdd30200698c3 in the approvals console. You cannot approve it. Tell the user it is waiting."}
+
+> get_case {"case_id":"CS-10231"}
+{"id":"CS-10231","priority":"P1","status":"open","open_hours":747.8,"escalation":null,"version":1,"customer_id":"ACC-007","customer":"Acme Corp","tier":"Platinum","renewal":"2027-01-15","days_to_renewal":52,"untrusted_subject":"Backup failing on node 3","comments_total":1,"comments":[{"at":"2026-10-24T09:00:00Z","untrusted_author":"jdoe","untrusted_body":"Investigating"}]}
+
